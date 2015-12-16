@@ -1,0 +1,12 @@
+[package]
+name = "dbusfs"
+version = "0.1.0"
+authors = ["Konstantin Stepanov <me@kstep.me>"]
+
+[dependencies]
+dbus = "*"
+fuse = "*"
+time = "*"
+libc = "*"
+users = "*"
+xml-rs = "*"
