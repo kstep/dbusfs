@@ -22,6 +22,7 @@ mod node;
 struct DbusFs {
     dbus: Connection,
     inodes: Vec<PathBuf>,
+    inode_attrs: Vec<FileAttr>,
     last_inode: AtomicUsize,
 }
 
@@ -36,26 +37,48 @@ impl DbusFs {
         Connection::get_private(bus).map(DbusFs::from_connection)
     }
 
-    fn inode<P: AsRef<Path>>(&mut self, path: P) -> u64 {
+    fn inode<P: AsRef<Path>>(&mut self, path: P, size: usize, uid: u32, gid: u32, is_dir: bool) -> &FileAttr {
         let path = path.as_ref();
         match self.inodes.iter().position(|p| p == path) {
-            Some(pos) => (pos + 2) as u64,
+            Some(pos) => &self.inode_attrs[pos],
             None => {
                 let ino = self.last_inode.fetch_add(1, Ordering::SeqCst);
-                self.inodes.insert(ino - 2, path.to_owned());
-                ino as u64
+                let index = ino - 2;
+                self.inodes.insert(index, path.to_owned());
+                self.inode_attrs.insert(index, FileAttr {
+                    ino: ino as u64,
+                    size: size as u64,
+                    blocks: 1,
+                    atime: CREATE_TIME,
+                    mtime: CREATE_TIME,
+                    ctime: CREATE_TIME,
+                    crtime: CREATE_TIME,
+                    kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
+                    perm: if is_dir { 0o755 } else { 0o644 },
+                    nlink: 1,
+                    uid: uid,
+                    gid: gid,
+                    rdev: 0,
+                    flags: 0,
+                });
+                &self.inode_attrs[index]
             }
         }
     }
 
     fn name_by_inode(&self, ino: u64) -> Option<&Path> {
-        self.inodes.get(ino as usize - 2).map(PathBuf::as_path)
+        self.inodes.get((ino - 2) as usize).map(PathBuf::as_path)
+    }
+
+    fn attr_by_inode(&self, ino: u64) -> Option<&FileAttr> {
+        self.inode_attrs.get((ino - 2) as usize)
     }
 
     fn from_connection(conn: Connection) -> DbusFs {
         DbusFs {
             dbus: conn,
             inodes: Vec::new(),
+            inode_attrs: Vec::new(),
             last_inode: AtomicUsize::new(2)
         }
     }
@@ -119,48 +142,15 @@ impl Filesystem for DbusFs {
                 let gid = get_user_by_uid(uid).map(|u| u.primary_group).unwrap_or(0);
                 match self.introspect(dest, obj) {
                     Ok(Some(s)) => {
-                        println!("{} => {}", name.display(), s);
-                        reply.entry(&TTL, &FileAttr {
-                            ino: self.inode(name),
-                            size: s.len() as u64,
-                            blocks: 1,
-                            atime: CREATE_TIME,
-                            mtime: CREATE_TIME,
-                            ctime: CREATE_TIME,
-                            crtime: CREATE_TIME,
-                            kind: FileType::Directory,
-                            perm: 0o755,
-                            nlink: 1,
-                            uid: uid,
-                            gid: gid,
-                            rdev: 0,
-                            flags: 0,
-                        }, 0);
+                        reply.entry(&TTL, self.inode(name, s.len(), uid, gid, true), 0);
                     },
                     Ok(None) => {
-                        println!("not found {}", name.display());
                         reply.error(ENOENT);
                     },
                     Err(ref err) if err.name() == Some(DBUS_ACCESS_ERROR) => {
-                        reply.entry(&TTL, &FileAttr {
-                            ino: self.inode(name),
-                            size: 0,
-                            blocks: 1,
-                            atime: CREATE_TIME,
-                            mtime: CREATE_TIME,
-                            ctime: CREATE_TIME,
-                            crtime: CREATE_TIME,
-                            kind: FileType::Directory,
-                            perm: 0o750,
-                            nlink: 1,
-                            uid: uid,
-                            gid: gid,
-                            rdev: 0,
-                            flags: 0,
-                        }, 0);
+                        reply.entry(&TTL, self.inode(name, 0, uid, gid, true), 0);
                     },
                     Err(err) => {
-                        println!("ERROR {}: {:?}", name.display(), err);
                         reply.error(ENOENT);
                     },
                 }
@@ -187,29 +177,10 @@ impl Filesystem for DbusFs {
                 rdev: 0,
                 flags: 0,
             }),
-            ino => match self.name_by_inode(ino)
-                .and_then(|n| split_path(&n))
-                .and_then(|(d, o)| self.introspect(d, o).ok())
-                .and_then(|v| v) {
-                Some(data) => reply.attr(&TTL, &FileAttr {
-                    ino: ino,
-                    size: data.len() as u64,
-                    blocks: 1,
-                    atime: CREATE_TIME,
-                    mtime: CREATE_TIME,
-                    ctime: CREATE_TIME,
-                    crtime: CREATE_TIME,
-                    kind: FileType::RegularFile,
-                    perm: 0o644,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    rdev: 0,
-                    flags: 0,
-                }),
+            ino => match self.attr_by_inode(ino) {
+                Some(attr) => reply.attr(&TTL, attr),
                 None => reply.error(ENOENT),
             },
-            //_ => reply.error(ENOENT)
         }
     }
 
