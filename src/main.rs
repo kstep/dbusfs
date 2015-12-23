@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 
 use time::Timespec;
-use dbus::{Connection, BusType, Message, MessageItem, FromMessageItem};
-use fuse::{Filesystem, FileType, FileAttr, ReplyDirectory, ReplyEntry, ReplyData, ReplyAttr, Request};
-use libc::{ENOENT, EACCES};
+use dbus::{BusType, Connection, FromMessageItem, Message, MessageItem};
+use fuse::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
+use libc::{EACCES, ENOENT};
 use users::get_user_by_uid;
 
 mod node;
@@ -106,8 +106,8 @@ impl DbusFs {
 
   fn get_connection_unix_user(&self, name: &dbus::BusName) -> Result<u32, dbus::Error> {
     let msg = Message::new_method_call(DBUS_INSPECT_DEST, DBUS_INSPECT_PATH, DBUS_INSPECT_IFACE, "GetConnectionUnixUser")
-                .unwrap()
-                .append(&**name);
+      .unwrap()
+      .append(&**name);
     self.dbus.send_with_reply_and_block(msg, 1000).map(|msg| {
       match msg.get_items().into_iter().next() {
         Some(MessageItem::UInt32(uid)) => uid,

@@ -86,11 +86,7 @@ impl NodeInfo {
       match ev {
         Ok(StartElement { name: OwnedName { local_name, .. }, attributes: attrs, .. }) => {
           match &*local_name {
-            "node" => {
-              nodeinfo.nodes.push(Node {
-                name: attrs.into_iter().find(|a| a.name.local_name == "name").map(|a| a.value).unwrap(),
-              })
-            }
+            "node" => nodeinfo.nodes.push(Node { name: attrs.into_iter().find(|a| a.name.local_name == "name").map(|a| a.value).unwrap() }),
             "interface" => {
               nodeinfo.interfaces.push(Interface::from_xml(attrs.into_iter()
                                                                 .find(|a| a.name.local_name == "name")
