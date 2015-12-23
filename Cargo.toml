@@ -2,6 +2,8 @@
 name = "dbusfs"
 version = "0.1.0"
 authors = ["Konstantin Stepanov <me@kstep.me>"]
+license = "MIT"
+description = "Fuse file system for DBUS introspection"
 
 [dependencies]
 dbus = "*"
@@ -10,3 +12,9 @@ time = "*"
 libc = "*"
 users = "*"
 xml-rs = "*"
+
+clippy = {version = "*", optional = true}
+
+[features]
+default = []
+dev = ["clippy"]

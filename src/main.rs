@@ -1,3 +1,6 @@
+#![cfg_attr(feature = "dev", feature(plugin))]
+#![cfg_attr(feature = "dev", plugin(clippy))]
+
 extern crate users;
 extern crate time;
 extern crate dbus;
