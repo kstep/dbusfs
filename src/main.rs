@@ -10,9 +10,7 @@ extern crate xml;
 
 use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::hash::{Hash, Hasher, SipHasher};
 use std::path::{Path, PathBuf};
-use std::collections::BTreeMap;
 
 use time::Timespec;
 use dbus::{Connection, BusType, Message, MessageItem, FromMessageItem};
@@ -29,10 +27,10 @@ struct DbusFs {
   last_inode: AtomicUsize,
 }
 
-static ORG_DBUS_FD_DEST: &'static str = "org.freedesktop.DBus";
-static ORG_DBUS_FD_IFACE: &'static str = "org.freedesktop.DBus";
-static ORG_DBUS_FD_PATH: &'static str = "/org/freedesktop/DBus";
-static ORG_DBUS_FD_INSPECT_IFACE: &'static str = "org.freedesktop.DBus.Introspectable";
+static DBUS_INSPECT_DEST: &'static str = "org.freedesktop.DBus";
+static DBUS_INSPECT_IFACE: &'static str = "org.freedesktop.DBus";
+static DBUS_INSPECT_PATH: &'static str = "/org/freedesktop/DBus";
+static DBUS_INTROSPECT_IFACE: &'static str = "org.freedesktop.DBus.Introspectable";
 static DBUS_ACCESS_ERROR: &'static str = "org.freedesktop.DBus.Error.AccessDenied";
 
 impl DbusFs {
@@ -88,7 +86,7 @@ impl DbusFs {
   }
 
   fn list_names(&self) -> Result<Vec<String>, dbus::Error> {
-    let msg = Message::new_method_call(ORG_DBUS_FD_DEST, ORG_DBUS_FD_PATH, ORG_DBUS_FD_IFACE, "ListNames").unwrap();
+    let msg = Message::new_method_call(DBUS_INSPECT_DEST, DBUS_INSPECT_PATH, DBUS_INSPECT_IFACE, "ListNames").unwrap();
     self.dbus.send_with_reply_and_block(msg, 1000).map(|msg| {
       match msg.get_items().into_iter().next() {
         Some(MessageItem::Array(items, _)) => {
@@ -107,7 +105,7 @@ impl DbusFs {
   }
 
   fn get_connection_unix_user(&self, name: &dbus::BusName) -> Result<u32, dbus::Error> {
-    let msg = Message::new_method_call(ORG_DBUS_FD_DEST, ORG_DBUS_FD_PATH, ORG_DBUS_FD_IFACE, "GetConnectionUnixUser")
+    let msg = Message::new_method_call(DBUS_INSPECT_DEST, DBUS_INSPECT_PATH, DBUS_INSPECT_IFACE, "GetConnectionUnixUser")
                 .unwrap()
                 .append(&**name);
     self.dbus.send_with_reply_and_block(msg, 1000).map(|msg| {
@@ -119,7 +117,7 @@ impl DbusFs {
   }
 
   fn introspect(&self, dest: dbus::BusName, object: dbus::Path) -> Result<Option<String>, dbus::Error> {
-    let msg = Message::new_method_call(dest, object, ORG_DBUS_FD_INSPECT_IFACE, "Introspect").unwrap();
+    let msg = Message::new_method_call(dest, object, DBUS_INTROSPECT_IFACE, "Introspect").unwrap();
 
     self.dbus.send_with_reply_and_block(msg, 1000).map(|msg| {
       match msg.get_items().into_iter().next() {
@@ -160,7 +158,7 @@ impl Filesystem for DbusFs {
     match parent {
       1 => {
         let uid = self.get_connection_unix_user(&dest).unwrap_or(0);
-        let gid = get_user_by_uid(uid).map(|u| u.primary_group).unwrap_or(0);
+        let gid = get_user_by_uid(uid).map_or(0, |u| u.primary_group);
         match self.introspect(dest, obj) {
           Ok(Some(s)) => {
             reply.entry(&TTL, self.inode(name, s.len(), uid, gid, true), 0);
@@ -171,7 +169,7 @@ impl Filesystem for DbusFs {
           Err(ref err) if err.name() == Some(DBUS_ACCESS_ERROR) => {
             reply.entry(&TTL, self.inode(name, 0, uid, gid, true), 0);
           }
-          Err(err) => {
+          Err(_) => {
             reply.error(ENOENT);
           }
         }
@@ -210,7 +208,7 @@ impl Filesystem for DbusFs {
     }
   }
 
-  fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, size: u32, reply: ReplyData) {
+  fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, _size: u32, reply: ReplyData) {
     match ino {
       1 => reply.error(ENOENT),
       ino => {
