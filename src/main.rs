@@ -13,10 +13,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 
 use time::Timespec;
-use dbus::{BusType, Connection, FromMessageItem, Message, MessageItem};
+use dbus::{BusType, Connection, Message, MessageItem};
 use fuse::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
 use libc::{EACCES, ENOENT};
 use users::get_user_by_uid;
+use node::NodeInfo;
 
 mod node;
 
@@ -32,6 +33,23 @@ static DBUS_INSPECT_IFACE: &'static str = "org.freedesktop.DBus";
 static DBUS_INSPECT_PATH: &'static str = "/org/freedesktop/DBus";
 static DBUS_INTROSPECT_IFACE: &'static str = "org.freedesktop.DBus.Introspectable";
 static DBUS_ACCESS_ERROR: &'static str = "org.freedesktop.DBus.Error.AccessDenied";
+
+static ROOT_DIR: FileAttr = FileAttr {
+  ino: 1,
+  size: 0,
+  blocks: 0,
+  atime: CREATE_TIME,
+  mtime: CREATE_TIME,
+  ctime: CREATE_TIME,
+  crtime: CREATE_TIME,
+  kind: FileType::Directory,
+  perm: 0o755,
+  nlink: 2,
+  uid: 0,
+  gid: 0,
+  rdev: 0,
+  flags: 0,
+};
 
 impl DbusFs {
   fn new(bus: BusType) -> Result<DbusFs, dbus::Error> {
@@ -49,7 +67,7 @@ impl DbusFs {
         self.inode_attrs.insert(index,
                                 FileAttr {
                                   ino: ino as u64,
-                                  size: size as u64,
+                                  size: if is_dir { 0 } else { size as u64 },
                                   blocks: 1,
                                   atime: CREATE_TIME,
                                   mtime: CREATE_TIME,
@@ -57,15 +75,21 @@ impl DbusFs {
                                   crtime: CREATE_TIME,
                                   kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
                                   perm: if is_dir { 0o755 } else { 0o644 },
-                                  nlink: 1,
+                                  nlink: if is_dir { 2 + size as u32 } else { 1 },
                                   uid: uid,
                                   gid: gid,
                                   rdev: 0,
                                   flags: 0,
                                 });
+        println!("{:?}", self.inodes);
         &self.inode_attrs[index]
       }
     }
+  }
+
+  #[inline]
+  fn list_dot_dirs(&self, ino: u64, offset: u64, reply: &mut ReplyDirectory) -> bool {
+    if offset < 2 { reply.add(1, 0, FileType::Directory, ".") && reply.add(1, 1, FileType::Directory, "..") } else { false }
   }
 
   fn name_by_inode(&self, ino: u64) -> Option<&Path> {
@@ -116,12 +140,12 @@ impl DbusFs {
     })
   }
 
-  fn introspect(&self, dest: dbus::BusName, object: dbus::Path) -> Result<Option<String>, dbus::Error> {
+  fn introspect(&self, dest: dbus::BusName, object: dbus::Path) -> Result<Option<NodeInfo>, dbus::Error> {
     let msg = Message::new_method_call(dest, object, DBUS_INTROSPECT_IFACE, "Introspect").unwrap();
 
     self.dbus.send_with_reply_and_block(msg, 1000).map(|msg| {
       match msg.get_items().into_iter().next() {
-        Some(MessageItem::Str(s)) => Some(s),
+        Some(MessageItem::Str(s)) => s.parse().ok(),
         _ => None,
       }
     })
@@ -137,8 +161,8 @@ const CREATE_TIME: Timespec = Timespec {
 fn split_path<P: AsRef<Path>>(path: P) -> Option<(dbus::BusName, dbus::Path)> {
   let path: &Path = path.as_ref();
   let mut iter = path.iter();
-  let dest = iter.next().and_then(|c| c.to_str()).and_then(|d| dbus::BusName::new(d).ok());
-  let obj = iter.as_path().to_str().and_then(|s| dbus::Path::new(if s.is_empty() { "/" } else { s }).ok());
+  let dest = iter.nth(1).and_then(|c| c.to_str()).and_then(|d| dbus::BusName::new(d).ok());
+  let obj = iter.as_path().to_str().and_then(|s| dbus::Path::new("/".to_owned() + s).ok());
   println!("{:?} => {:?} {:?}", path.display(), dest, obj);
 
   match (dest, obj) {
@@ -150,55 +174,38 @@ fn split_path<P: AsRef<Path>>(path: P) -> Option<(dbus::BusName, dbus::Path)> {
 
 impl Filesystem for DbusFs {
   fn lookup(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
-    let (dest, obj) = match split_path(name) {
+    let parent = if parent == 1 {
+      PathBuf::from("/")
+    } else {
+      match self.name_by_inode(parent) {
+        Some(name) => name.to_owned(),
+        None => return reply.error(ENOENT),
+      }
+    };
+    let name = parent.join(name);
+    let (dest, obj) = match split_path(&name) {
       Some(p) => p,
       None => return reply.error(ENOENT),
     };
+    let uid = self.get_connection_unix_user(&dest).unwrap_or(0);
+    let gid = get_user_by_uid(uid).map_or(0, |u| u.primary_group);
 
-    match parent {
-      1 => {
-        let uid = self.get_connection_unix_user(&dest).unwrap_or(0);
-        let gid = get_user_by_uid(uid).map_or(0, |u| u.primary_group);
-        match self.introspect(dest, obj) {
-          Ok(Some(s)) => {
-            reply.entry(&TTL, self.inode(name, s.len(), uid, gid, true), 0);
-          }
-          Ok(None) => {
-            reply.error(ENOENT);
-          }
-          Err(ref err) if err.name() == Some(DBUS_ACCESS_ERROR) => {
-            reply.entry(&TTL, self.inode(name, 0, uid, gid, true), 0);
-          }
-          Err(_) => {
-            reply.error(ENOENT);
-          }
-        }
+    match self.introspect(dest, obj) {
+      Ok(Some(s)) => {
+        println!("{:?}", s);
+        reply.entry(&TTL, self.inode(&name, s.nodes.len(), uid, gid, true), 0);
       }
-      _ => reply.error(ENOENT),
+      Ok(None) => {
+        reply.error(ENOENT);
+      }
+      Err(ref err) if err.name() == Some(DBUS_ACCESS_ERROR) => reply.entry(&TTL, self.inode(&name, 0, uid, gid, true), 0),
+      Err(_) => reply.error(ENOENT),
     }
   }
 
   fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
     match ino {
-      1 => {
-        reply.attr(&TTL,
-                   &FileAttr {
-                     ino: 1,
-                     size: 0,
-                     blocks: 0,
-                     atime: CREATE_TIME,
-                     mtime: CREATE_TIME,
-                     ctime: CREATE_TIME,
-                     crtime: CREATE_TIME,
-                     kind: FileType::Directory,
-                     perm: 0o755,
-                     nlink: 2,
-                     uid: 0,
-                     gid: 0,
-                     rdev: 0,
-                     flags: 0,
-                   })
-      }
+      1 => reply.attr(&TTL, &ROOT_DIR),
       ino => {
         match self.attr_by_inode(ino) {
           Some(attr) => reply.attr(&TTL, attr),
@@ -211,12 +218,12 @@ impl Filesystem for DbusFs {
   fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, _size: u32, reply: ReplyData) {
     match ino {
       1 => reply.error(ENOENT),
-      ino => {
-        match self.name_by_inode(ino).and_then(split_path).and_then(|(d, o)| self.introspect(d, o).ok()) {
-          Some(Some(data)) => reply.data(&data.as_bytes()[offset as usize..]),
-          _ => reply.error(ENOENT),
-        }
-      }
+      // ino => {
+      // match self.name_by_inode(ino).and_then(split_path).and_then(|(d, o)| self.introspect(d, o).ok()) {
+      // Some(Some(data)) => reply.data(&data.as_bytes()[offset as usize..]),
+      _ => reply.error(ENOENT),
+      // }
+      // }
     }
   }
 
@@ -225,13 +232,11 @@ impl Filesystem for DbusFs {
       1 => {
         match self.list_names() {
           Ok(items) => {
-            if offset < 2 {
-              reply.add(1, 0, FileType::Directory, ".");
-              reply.add(1, 1, FileType::Directory, "..");
-            }
-            for (no, item) in items.into_iter().enumerate().skip(offset as usize) {
-              if reply.add(offset + (no + 2) as u64, offset + (no + 2) as u64, FileType::Directory, &*item) {
-                break;
+            if !self.list_dot_dirs(ino, offset, &mut reply) {
+              for (no, item) in items.into_iter().enumerate().skip(offset as usize) {
+                if reply.add(offset + (no + 2) as u64, offset + (no + 2) as u64, FileType::Directory, &*item) {
+                  break;
+                }
               }
             }
             reply.ok();
@@ -239,7 +244,30 @@ impl Filesystem for DbusFs {
           Err(_) => reply.error(ENOENT),
         }
       }
-      _ => reply.error(ENOENT),
+      ino => {
+        match self.name_by_inode(ino).map(ToOwned::to_owned) {
+          Some(ref path) => {
+            match split_path(path).map(|(d, o)| self.introspect(d, o)) {
+              Some(Ok(Some(node_info))) => {
+                if !self.list_dot_dirs(ino, offset, &mut reply) {
+                  for (no, item) in node_info.nodes.into_iter().enumerate().skip(offset as usize) {
+                    let attr = self.inode(path.join(&*item.name), 0, 0, 0, true);
+                    if reply.add(attr.ino, offset + (no + 2) as u64, FileType::Directory, &*item.name) {
+                      break;
+                    }
+                  }
+                }
+                reply.ok();
+              }
+              None | Some(Ok(None)) => {
+                reply.error(ENOENT);
+              }
+              Some(Err(ref err)) => reply.error(if err.name() == Some(DBUS_ACCESS_ERROR) { EACCES } else { ENOENT }),
+            }
+          }
+          None => reply.error(ENOENT),
+        }
+      }
     }
   }
 }
