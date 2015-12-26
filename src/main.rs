@@ -178,7 +178,6 @@ fn split_path<P: AsRef<Path>>(path: P) -> Option<(dbus::BusName, dbus::Path)> {
   let mut iter = path.iter();
   let dest = iter.next().and_then(|c| c.to_str()).and_then(|d| dbus::BusName::new(d).ok());
   let obj = iter.as_path().to_str().and_then(|s| dbus::Path::new("/".to_owned() + s).ok());
-  println!("{:?} => {:?} {:?}", path.display(), dest, obj);
 
   match (dest, obj) {
     (Some(dest), Some(obj)) => Some((dest, obj)),
@@ -187,10 +186,10 @@ fn split_path<P: AsRef<Path>>(path: P) -> Option<(dbus::BusName, dbus::Path)> {
 }
 
 #[inline]
-fn list_dot_dirs(ino: u64, pino: u64, offset: u64, reply: &mut ReplyDirectory) -> bool {
+fn list_dot_dirs(ino: u64, offset: u64, reply: &mut ReplyDirectory) -> bool {
   if offset == 0 {
     reply.add(ino, 0, FileType::Directory, ".") ||
-      reply.add(pino, 1, FileType::Directory, "..")
+      reply.add(ino, 1, FileType::Directory, "..")
   } else {
     false
   }
@@ -199,7 +198,6 @@ fn list_dot_dirs(ino: u64, pino: u64, offset: u64, reply: &mut ReplyDirectory) -
 
 impl Filesystem for DbusFs {
   fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-    println!(">>> getattr {}", ino);
     match ino {
       1 => reply.attr(&TTL, &ROOT_DIR),
       ino => {
@@ -212,16 +210,15 @@ impl Filesystem for DbusFs {
   }
 
   fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, mut reply: ReplyDirectory) {
-    println!(">>> readdir {} {}", ino, offset);
     match ino {
       1 => {
-        if list_dot_dirs(ino, 1, offset, &mut reply) {
+        if list_dot_dirs(ino, offset, &mut reply) {
           return reply.ok();
         }
 
         match self.list_names() {
           Ok(items) => {
-            for (no, name) in items.into_iter().enumerate().skip(offset as usize) {
+            for (no, name) in items.into_iter().skip(offset as usize).enumerate() {
               if let Some(attr) = self.make_inode(&*name) {
                 if reply.add(attr.ino, offset + (no + 2) as u64, attr.kind, &*name) {
                   break;
@@ -247,12 +244,15 @@ impl Filesystem for DbusFs {
 
         match self.introspect(dest, object) {
           Ok(Some(ni)) => {
-            if !list_dot_dirs(ino, ino, offset, &mut reply) {
-              for (no, node) in ni.nodes.iter().enumerate().skip(offset as usize) {
-                let path = parent.join(&*node.name);
-                if let Some(attr) = self.make_inode(path) {
-                  if reply.add(attr.ino, offset + (no + 2) as u64, attr.kind, &*node.name) {
-                    break;
+            if !list_dot_dirs(ino, offset, &mut reply) {
+              if ni.nodes.is_empty() {
+              } else {
+                for (no, node) in ni.nodes.iter().skip(offset as usize).enumerate() {
+                  let path = parent.join(&*node.name);
+                  if let Some(attr) = self.make_inode(path) {
+                    if reply.add(attr.ino, offset + (no + 2) as u64, attr.kind, &*node.name) {
+                      break;
+                    }
                   }
                 }
               }
@@ -272,7 +272,6 @@ impl Filesystem for DbusFs {
   }
 
   fn lookup(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
-    println!(">>> lookup {} {}", parent, name.display());
     let path = match parent {
       1 => name.to_owned(),
       n => match self.path_by_inode(n) {
