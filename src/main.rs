@@ -11,6 +11,7 @@ extern crate xml;
 use std::env;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 use time::Timespec;
 use dbus::{BusType, Connection, Message, MessageItem};
@@ -23,8 +24,8 @@ mod node;
 
 struct DbusFs {
   dbus: Connection,
-  inodes: Vec<PathBuf>,
-  inode_attrs: Vec<FileAttr>,
+  inodes: HashMap<u64, PathBuf>,
+  inode_attrs: HashMap<u64, FileAttr>,
   last_inode: AtomicUsize,
 }
 
@@ -65,21 +66,19 @@ impl DbusFs {
   fn from_connection(conn: Connection) -> DbusFs {
     DbusFs {
       dbus: conn,
-      inodes: Vec::new(),
-      inode_attrs: Vec::new(),
+      inodes: HashMap::new(),
+      inode_attrs: HashMap::new(),
       last_inode: AtomicUsize::new(2),
     }
   }
 
   fn make_inode<P: AsRef<Path>>(&mut self, path: P) -> Option<&FileAttr> {
     let path = path.as_ref();
-    if let Some(pos) = self.inodes.iter().position(|p| p == path) {
-      return Some(&self.inode_attrs[pos]);
+    if let Some((ino, _)) = self.inodes.iter().find(|&(_, p)| p == path) {
+      return Some(&self.inode_attrs[ino]);
     }
 
     let ino = self.last_inode.fetch_add(1, Ordering::SeqCst) as u64;
-    let index = (ino - 2) as usize;
-    self.inodes.insert(index, path.to_owned());
 
     let (dest, object) = match split_path(path) {
       Some((d, o)) => (d, o),
@@ -112,16 +111,17 @@ impl DbusFs {
       flags: 0,
     };
 
-    self.inode_attrs.insert(index, attr);
-    self.inode_attrs.get(index)
+    self.inodes.insert(ino, path.to_owned());
+    self.inode_attrs.insert(ino, attr);
+    self.inode_attrs.get(&ino)
   }
 
   fn path_by_inode(&self, ino: u64) -> Option<&Path> {
-    self.inodes.get((ino - 2) as usize).map(PathBuf::as_path)
+    self.inodes.get(&ino).map(PathBuf::as_path)
   }
 
   fn attr_by_inode(&self, ino: u64) -> Option<&FileAttr> {
-    self.inode_attrs.get((ino - 2) as usize)
+    self.inode_attrs.get(&ino)
   }
 
   fn list_names(&self) -> Result<Vec<String>, dbus::Error> {
@@ -188,12 +188,18 @@ fn split_path<P: AsRef<Path>>(path: P) -> Option<(dbus::BusName, dbus::Path)> {
 
 #[inline]
 fn list_dot_dirs(ino: u64, pino: u64, offset: u64, reply: &mut ReplyDirectory) -> bool {
-  if offset < 2 { reply.add(ino, 0, FileType::Directory, ".") && reply.add(pino, 1, FileType::Directory, "..") } else { false }
+  if offset == 0 {
+    reply.add(ino, 0, FileType::Directory, ".") ||
+      reply.add(pino, 1, FileType::Directory, "..")
+  } else {
+    false
+  }
 }
 
 
 impl Filesystem for DbusFs {
   fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    println!(">>> getattr {}", ino);
     match ino {
       1 => reply.attr(&TTL, &ROOT_DIR),
       ino => {
@@ -206,6 +212,7 @@ impl Filesystem for DbusFs {
   }
 
   fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, mut reply: ReplyDirectory) {
+    println!(">>> readdir {} {}", ino, offset);
     match ino {
       1 => {
         if list_dot_dirs(ino, 1, offset, &mut reply) {
@@ -214,7 +221,7 @@ impl Filesystem for DbusFs {
 
         match self.list_names() {
           Ok(items) => {
-            for (no, name) in items.into_iter().skip(offset as usize).enumerate() {
+            for (no, name) in items.into_iter().enumerate().skip(offset as usize) {
               if let Some(attr) = self.make_inode(&*name) {
                 if reply.add(attr.ino, offset + (no + 2) as u64, attr.kind, &*name) {
                   break;
@@ -241,7 +248,7 @@ impl Filesystem for DbusFs {
         match self.introspect(dest, object) {
           Ok(Some(ni)) => {
             if !list_dot_dirs(ino, ino, offset, &mut reply) {
-              for (no, node) in ni.nodes.iter().skip(offset as usize).enumerate() {
+              for (no, node) in ni.nodes.iter().enumerate().skip(offset as usize) {
                 let path = parent.join(&*node.name);
                 if let Some(attr) = self.make_inode(path) {
                   if reply.add(attr.ino, offset + (no + 2) as u64, attr.kind, &*node.name) {
@@ -265,6 +272,7 @@ impl Filesystem for DbusFs {
   }
 
   fn lookup(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
+    println!(">>> lookup {} {}", parent, name.display());
     let path = match parent {
       1 => name.to_owned(),
       n => match self.path_by_inode(n) {
