@@ -12,22 +12,73 @@ use xml::name::OwnedName;
 use xml::attribute::OwnedAttribute;
 use xml::reader::Events;
 
-// enum BasicTypeSig {
-// Byte, // y
-// Bool, // b
-// Int16, // n
-// UInt16, // q
-// Int32, // i
-// Uint32, // u
-// Int64, // x
-// UInt64, // t
-// Double, // d
-// UnixFd, // h
-// String, // s
-// ObjPath, // o
-// Sig, // g
-// Variant, // v
-// }
+mod types {
+  use std::str::FromStr;
+
+  enum Basic {
+    Byte, // y
+    Bool, // b
+    Int16, // n
+    UInt16, // q
+    Int32, // i
+    UInt32, // u
+    Int64, // x
+    UInt64, // t
+    Double, // d
+    UnixFd, // h
+    String, // s
+    ObjPath, // o
+    TypeSig, // g
+    Variant, // v
+  }
+
+  enum Full {
+    Basic(Basic),
+    Struct(Vec<Full>), // r, (...)
+    Array(Box<Full>), // a...
+    Dict(Basic, Box<Full>), // e, {...}
+  }
+
+  enum TypeSigError {
+    InvalidChar,
+    EndOfStruct,
+    EndOfDictEntry,
+  }
+
+  impl FromStr for Basic {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Basic, ()> {
+      use self::Basic::*;
+      Ok(match s[0..1] {
+        "y" => Byte,
+        "b" => Bool,
+        "n" => Int16,
+        "q" => UInt16,
+        "i" => Int32,
+        "u" => UInt32,
+        "x" => Int64,
+        "t" => UInt64,
+        "d" => Double,
+        "h" => UnixFd,
+        "s" => String,
+        "o" => ObjPath,
+        "g" => TypeSig,
+        "v" => Variant,
+        _ => return Err(TypeSigError::InvalidChar)
+      })
+    }
+  }
+
+  impl FromStr for Full {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Full, ()> {
+      use self::Basic::*;
+      s.parse::<Basic>().map(Basic).or_else(|_| match s[0..1] {
+        "(" => 
+      })
+    }
+  }
+}
 
 
 #[derive(Debug, PartialEq, Eq, Clone)]

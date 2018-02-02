@@ -22,10 +22,21 @@ use node::NodeInfo;
 
 mod node;
 
+enum NodeKind {
+  Destination,
+  ObjectPath,
+  Interface,
+  Method,
+  Signal,
+  Property,
+  Annotation,
+}
+
 struct DbusFs {
   dbus: Connection,
-  inodes: HashMap<u64, PathBuf>,
-  inode_attrs: HashMap<u64, FileAttr>,
+  inodes: HashMap<(u64, PathBuf), u64>,
+  inode_attr: HashMap<u64, FileAttr>,
+  inode_name: HashMap<u64, (NodeKind, dbus::BusName, dbus::Path, Option<dbus::Interface>, Option<dbus::Member>)>,
   last_inode: AtomicUsize,
 }
 
@@ -67,7 +78,8 @@ impl DbusFs {
     DbusFs {
       dbus: conn,
       inodes: HashMap::new(),
-      inode_attrs: HashMap::new(),
+      inode_attr: HashMap::new(),
+      inode_name: HashMap::new(),
       last_inode: AtomicUsize::new(2),
     }
   }
@@ -75,7 +87,7 @@ impl DbusFs {
   fn make_inode<P: AsRef<Path>>(&mut self, path: P) -> Option<&FileAttr> {
     let path = path.as_ref();
     if let Some((ino, _)) = self.inodes.iter().find(|&(_, p)| p == path) {
-      return Some(&self.inode_attrs[ino]);
+      return Some(&self.inode_attr[ino]);
     }
 
     let ino = self.last_inode.fetch_add(1, Ordering::SeqCst) as u64;
@@ -112,8 +124,45 @@ impl DbusFs {
     };
 
     self.inodes.insert(ino, path.to_owned());
-    self.inode_attrs.insert(ino, attr);
-    self.inode_attrs.get(&ino)
+    self.inode_attr.insert(ino, attr);
+    self.inode_attr.get(&ino)
+  }
+
+  fn file_attr_dir(&mut self, ino: u64) -> FileAttr {
+    FileAttr {
+      ino: ino,
+      size: 0,
+      blocks: 1,
+      atime: CREATE_TIME,
+      mtime: CREATE_TIME,
+      ctime: CREATE_TIME,
+      crtime: CREATE_TIME,
+      kind: FileType::Directory,
+      perm: 0o755,
+      nlink: 2,
+      uid: 0,
+      gid: 0,
+      rdev: 0,
+      flags: 0,
+    }
+  }
+  fn file_attr_file(&mut self, ino: u64) -> FileAttr {
+    FileAttr {
+      ino: ino,
+      size: 0,
+      blocks: 1,
+      atime: CREATE_TIME,
+      mtime: CREATE_TIME,
+      ctime: CREATE_TIME,
+      crtime: CREATE_TIME,
+      kind: FileType::Directory,
+      perm: 0o644,
+      nlink: 1,
+      uid: 0,
+      gid: 0,
+      rdev: 0,
+      flags: 0,
+    }
   }
 
   fn path_by_inode(&self, ino: u64) -> Option<&Path> {
@@ -121,7 +170,7 @@ impl DbusFs {
   }
 
   fn attr_by_inode(&self, ino: u64) -> Option<&FileAttr> {
-    self.inode_attrs.get(&ino)
+    self.inode_attr.get(&ino)
   }
 
   fn list_names(&self) -> Result<Vec<String>, dbus::Error> {
@@ -272,17 +321,56 @@ impl Filesystem for DbusFs {
   }
 
   fn lookup(&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
-    let path = match parent {
-      1 => name.to_owned(),
-      n => match self.path_by_inode(n) {
-        Some(p) => p.join(name),
-        None => return reply.error(ENOENT),
-      }
-    };
+    println!("lookup: ({}, {})", parent, name.display());
 
-    match self.make_inode(&path) {
-      Some(attr) => reply.entry(&TTL, attr, 0),
-      None => reply.error(ENOENT),
+    if let Some(attr) = self.inodes.get((parent, name)).and_then(|ino| self.inode_attr.get(ino)) {
+      return reply.attr(&TTL, attr, 0);
+    }
+
+    if let Some(parent) = self.inode_name(parent) {
+      let node_info = match self.introspect(parent.1, parent.2) {
+        Ok(Some(info)) => info,
+        _ => return reply.error(ENOENT),
+      };
+
+      let (attr, name) = match parent.0 {
+        NodeKind::Destination => if node_info.nodes.find(|&n| n.name == name).is_some() {
+          // directory with given name, kind is ObjectPath
+          (file_attr_dir(self.last_inode.fetch_add(1, Ordering::SeqCst)), (NodeKind::ObjectPath, parent.1, parent.2.join(name), None, None))
+        },
+        NodeKind::ObjectPath => if node_info.nodes.find(|&n| n.name == name).is_some() {
+          // directory with given name, kind is ObjectPath
+          (file_attr_dir(self.last_inode.fetch_add(1, Ordering::SeqCst)), (NodeKind::ObjectPath, parent.1, parent.2.join(name), None, None))
+        } else if let Some(iface) = node_info.interfaces.find(|&i| i.name == name) {
+          // directory with given name, kind is Interface
+          (file_attr_dir(self.last_inode.fetch_add(1, Ordering::SeqCst)), (NodeKind::Interface, parent.1, parent.2, Some(name), None))
+        },
+        NodeKind::Interface => if let Some(iface) = node_info.interfaces.find(|&n| n.name == parent.3) {
+          // file with given name
+          if let Some(method) = iface.methods.find(|&n| n.name == name) {
+            // kind is Method
+            (file_attr_file(self.last_inode.fetch_add(1, Ordering::SeqCst)), (NodeKind::Method, parent.1, parent.2, parent.3, Some(name)))
+          } else if let Some(prop) = iface.properties.find(|&n| n.name == name) {
+            // kind is Property
+            (file_attr_file(self.last_inode.fetch_add(1, Ordering::SeqCst)), (NodeKind::Property, parent.1, parent.2, parent.3, Some(name)))
+          } else if let Some(signal) = iface.signals.find(|&n| n.name == name) {
+            // kind is Signal
+            (file_attr_file(self.last_inode.fetch_add(1, Ordering::SeqCst)), (NodeKind::Signal, parent.1, parent.2, parent.3, Some(name)))
+          } else if let Some(anno) = iface.annotations.get(name) {
+            // kind is Annotation
+            (file_attr_file(self.last_inode.fetch_add(1, Ordering::SeqCst)), (NodeKind::Annotation, parent.1, parent.2, parent.3, Some(name)))
+          }
+        },
+        _ => return reply.error(ENOENT),
+      };
+
+      let ino = attr.ino;
+      reply.entry(&TTL, &attr, 0);
+      self.inode_name.insert(ino, name);
+      self.inode_attr.insert(ino, attr);
+
+    } else {
+      return reply.error(ENOENT);
     }
   }
 
